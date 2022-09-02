@@ -5,6 +5,7 @@ use std::{net::SocketAddr, path::PathBuf};
 #[derive(Deserialize)]
 pub struct TlsIdentity {
     pub server_cert: PathBuf,
+    pub server_key: PathBuf,
 }
 
 #[derive(Deserialize)]

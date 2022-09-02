@@ -5,10 +5,12 @@
 #![deny(clippy::all)]
 
 use common::rpc::{RpcHello, RpcFail};
-use native_tls::Identity;
 use clap::Arg;
+use tokio::io::AsyncWriteExt;
+use tokio_rustls::TlsAcceptor;
 use log::*;
 use tokio::time::timeout;
+use std::io::Cursor;
 use std::mem::discriminant;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -167,6 +169,7 @@ async fn handle_client<S: AsyncRead + AsyncWrite + Unpin>(state: &SharedState, m
 
     loop {
         handle_transaction(state, &hello, &mut stream).await?;
+        stream.flush().await?;
     }
 }
 
@@ -178,7 +181,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(state: &SharedStat
     }
 }
 
-async fn serve(listener: TcpListener, accpt: Option<tokio_native_tls::TlsAcceptor>, state: SharedState) {
+async fn serve(listener: TcpListener, accpt: Option<TlsAcceptor>, state: SharedState) {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let accpt = accpt.map(Arc::new);
 
@@ -248,6 +251,12 @@ async fn maintenance(state: std::sync::Weak<SharedState_>) {
     }
 }
 
+fn read_pem(buf: Vec<u8>) -> Result<rustls_pemfile::Item, std::io::Error> {
+    let mut reader = Cursor::new(&buf);
+    rustls_pemfile::read_one(&mut reader)?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "failed to parse as PEM"))
+}
+
 fn main() {
     setup_logger();
     let matches = clap::Command::new("lumen")
@@ -272,7 +281,7 @@ fn main() {
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_stack_size(8 * 1024)
+        .thread_stack_size(32 * 1024)
         .build() {
         Ok(v) => v,
         Err(err) => {
@@ -301,42 +310,57 @@ fn main() {
 
     rt.spawn(maintenance(Arc::downgrade(&state)));
 
-    let tls_acceptor;
-
-    if state.config.lumina.use_tls.unwrap_or_default() {
-        let cert_path = &state.config.lumina.tls.as_ref().expect("tls section is missing").server_cert;
-        let mut crt = match std::fs::read(cert_path) {
-            Ok(v) => v,
+    let tls_acceptor = if state.config.lumina.use_tls.unwrap_or_default() {
+        let tls_info = state.config.lumina.tls.as_ref().expect("tls section is missing");
+        let cert_path = &tls_info.server_cert;
+        let key_path = &tls_info.server_key;
+        let crt = match std::fs::read(cert_path) {
+            Ok(v) => match read_pem(v) {
+                Ok(v) => if let rustls_pemfile::Item::X509Certificate(v) = v {
+                    tokio_rustls::rustls::Certificate(v)
+                } else {
+                    error!("expected PEM to contain X509Certificate.");
+                    exit(1);
+                },
+                Err(e) => {
+                    error!("failed to parse key: {e}");
+                    exit(1);
+                }
+            },
             Err(err) => {
                 error!("failed to read certificate file: {}", err);
                 exit(1);
             }
         };
-        let pkcs_passwd = std::env::var("PKCSPASSWD").unwrap_or_default();
-        let id = match Identity::from_pkcs12(&crt, &pkcs_passwd) {
-            Ok(v) => v,
+        let key = match std::fs::read(key_path) {
+            Ok(v) => match read_pem(v) {
+                Ok(v) => if let rustls_pemfile::Item::PKCS8Key(v) = v {
+                    tokio_rustls::rustls::PrivateKey(v)
+                } else {
+                    error!("expected PEM to contain PKCS8Key.");
+                    exit(1);
+                },
+                Err(e) => {
+                    error!("failed to parse key: {e}");
+                    exit(1);
+                }
+            },
             Err(err) => {
-                error!("failed to parse tls certificate: {}", err);
+                error!("failed to read key file: {}", err);
                 exit(1);
             }
         };
-        let _ = pkcs_passwd;
-        crt.iter_mut().for_each(|v| *v = 0);
-        let _ = crt;
-        let mut accpt = native_tls::TlsAcceptor::builder(id);
-        accpt.min_protocol_version(Some(native_tls::Protocol::Sslv3));
-        let accpt = match accpt.build() {
-            Ok(v) => v,
-            Err(err) => {
-                error!("failed to build tls acceptor: {}", err);
-                exit(1);
-            },
-        };
-        let accpt = tokio_native_tls::TlsAcceptor::from(accpt);
-        tls_acceptor = Some(accpt);
+        let server_config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(vec![crt], key)
+            .expect("failed to build ServerConfig");
+        
+        let accpt = TlsAcceptor::from(Arc::new(server_config));
+        Some(accpt)
     } else {
-        tls_acceptor = None;
-    }
+        None
+    };
 
     if let Some(ref webcfg) = state.config.api_server {
         let bind_addr = webcfg.bind_addr;
