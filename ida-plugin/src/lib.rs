@@ -1,11 +1,11 @@
-use std::{sync::Mutex, ptr::addr_of};
-use windows::{Win32::{System::Diagnostics::{ToolHelp::{
+use std::{sync::Mutex, ptr::{addr_of, null_mut}};
+use windows::{Win32::{System::{Diagnostics::{ToolHelp::{
     CreateToolhelp32Snapshot,
     Module32FirstW,
     Module32NextW,
     MODULEENTRY32W,
     TH32CS_SNAPMODULE
-}, Debug::{ImageNtHeader, IMAGE_SECTION_HEADER}}, Foundation::CloseHandle, UI::WindowsAndMessaging::{MessageBoxW, MESSAGEBOX_STYLE}}, w, core::PCWSTR};
+}, Debug::{ImageNtHeader, IMAGE_SECTION_HEADER}}, Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE}}, Foundation::CloseHandle, UI::WindowsAndMessaging::{MessageBoxW, MESSAGEBOX_STYLE}}, w, core::PCWSTR};
 
 const ORIGINAL_CERT: &[u8] = include_bytes!("../original.pem");
 const OUR_CERT: &[u8] = include_bytes!("../cert.pem");
@@ -100,7 +100,12 @@ unsafe fn find_ida64() -> Option<(usize, usize)> {
                     let cert = Vec::leak(cert);
                     let cert_addr = cert.as_ptr() as usize;
 
-                    core::ptr::write_unaligned(ptr_addr as *mut usize, cert_addr);
+                    let mut old_flags = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS::default();
+                    if VirtualProtect(ptr_addr as _, 8, PAGE_EXECUTE_READWRITE, &mut old_flags).as_bool() {
+                        core::ptr::write_unaligned(ptr_addr as *mut usize, cert_addr);
+
+                        VirtualProtect(ptr_addr as _, 8, old_flags, null_mut());
+                    }
                 }
             }
 
