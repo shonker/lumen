@@ -2,6 +2,7 @@
 members = [
     "common",
     "lumen",
+    "ida-plugin",
 ]
 
 [profile.release]
